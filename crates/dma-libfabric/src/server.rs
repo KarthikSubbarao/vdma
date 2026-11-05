@@ -9,18 +9,21 @@
 //! Completions go back to the caller in batches via the `complete_batch` hook, so a whole batch
 //! finishes under one lock acquisition rather than one per op.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Sender, channel};
+use std::sync::{Arc, PoisonError};
 use std::thread::JoinHandle;
 
 use dma_libfabric_protocol::DmaError;
 
 use crate::configuration::Configuration;
+use crate::endpoint::SharedDomain;
+use crate::local_regions::LocalRegions;
 use crate::memory_region::MemoryRegion;
 use crate::operands::Operands;
 use crate::pool::Pool;
 use crate::reply::{Answer, reply};
+use crate::sys::fid_domain;
 
 /// Direction of the one-sided RMA the server initiates against the client's exposed buffer.
 #[derive(Debug, Clone, Copy)]
@@ -100,13 +103,6 @@ pub enum WorkerMessage<TContext> {
     },
     /// Remove this disconnected client's peer once its in-flight transfers have drained.
     RemovePeer(u64),
-    /// Register a caller-owned span on this worker's domain, answering on `reply`. This keeps
-    /// domain calls on the worker thread who owns it.
-    Register {
-        base: usize,
-        length: usize,
-        reply: Answer<Result<(), DmaError>>,
-    },
 }
 
 /// A sideband an rpc server uses to implement data-transfer commands over a faster transport. It
@@ -125,6 +121,9 @@ pub struct FabricService<TContext: Send + 'static> {
     /// this device's backlog is visible to a caller balancing across devices. Shared with the worker,
     /// which decrements as each op finishes.
     outstanding: Arc<AtomicUsize>,
+    /// The worker endpoint's domain, for [`Self::register`] to pin on from the caller's thread.
+    /// `None` when the provider needs no local registrations (tcp).
+    local_mr_domain: Option<SharedDomain>,
 }
 
 impl<TContext: Send + 'static> std::fmt::Debug for FabricService<TContext> {
@@ -174,11 +173,12 @@ impl<TContext: Send + 'static> FabricService<TContext> {
             })
             .map_err(|error| DmaError::Fabric(format!("failed to spawn fabric worker: {error}")))?;
         match ready.wait() {
-            Some(Ok(address)) => Ok(Self {
+            Some(Ok((address, local_mr_domain))) => Ok(Self {
                 sender: Some(sender),
                 dma_worker_handle: Some(handle),
                 address,
                 outstanding,
+                local_mr_domain,
             }),
             Some(Err(error)) => {
                 let _ = handle.join();
@@ -226,6 +226,9 @@ impl<TContext: Send + 'static> FabricService<TContext> {
 
     /// Register `storage`, blocking until it is resident.
     ///
+    /// fi_mr_reg runs on the calling thread, not the worker: pinning a large span takes tens of
+    /// milliseconds, and on the worker it would stall every transfer this server carries.
+    ///
     /// Transfers submitted to this server whose operands live in `storage` skip `fi_mr_reg`.
     /// Submitting them to a different server still works. However that server's domain has no
     /// registration covering them, so it takes one per operation. It's slower that way.
@@ -248,21 +251,12 @@ impl<TContext: Send + 'static> FabricService<TContext> {
             .checked_add(length)
             .ok_or_else(|| DmaError::Fabric("registered region range overflows".into()))?;
 
-        let sender = self
-            .sender
-            .as_ref()
-            .ok_or_else(|| DmaError::Fabric("fabric worker is gone".into()))?;
-        let (answer, waiting) = reply();
-        sender
-            .send(WorkerMessage::Register {
-                base,
-                length,
-                reply: answer,
-            })
-            .map_err(|_| DmaError::Fabric("fabric worker is gone".into()))?;
-        waiting
-            .wait()
-            .ok_or_else(|| DmaError::Fabric("fabric worker exited before registering".into()))??;
+        if let Some(shared) = &self.local_mr_domain {
+            // Held across the pin, so the endpoint cannot close the domain under it.
+            let domain = shared.read().unwrap_or_else(PoisonError::into_inner);
+            let domain = domain.ok_or_else(|| DmaError::Fabric("fabric worker is gone".into()))?;
+            LocalRegions::new(domain as *mut fid_domain).pin(base, length)?;
+        }
         Ok(MemoryRegion::new(storage, base, end))
     }
 

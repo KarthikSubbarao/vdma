@@ -20,6 +20,7 @@ use crate::Operands;
 use crate::TransferDone;
 use crate::TransferRequest;
 use crate::endpoint::LibfabricEndpoint;
+use crate::endpoint::SharedDomain;
 use crate::error::fabric_error;
 use crate::local_regions::LocalOperand;
 use crate::pool::Pool;
@@ -31,9 +32,13 @@ use crate::server::WorkerMessage;
 /// batch, and so one downstream lock acquisition, accumulates.
 const TARGET_COMPLETIONS: usize = 10;
 
+/// The worker's readiness signal: its endpoint's fabric address, and the domain handle callers
+/// register on when the provider needs local registrations.
+pub(crate) type WorkerReady = (Vec<u8>, Option<SharedDomain>);
+
 pub fn worker_main<T: Operands + Send + 'static>(
     configuration: Configuration,
-    ready: Answer<Result<Vec<u8>, DmaError>>,
+    ready: Answer<Result<WorkerReady, DmaError>>,
     receiver: &Receiver<WorkerMessage<T>>,
     complete_batch: Arc<BatchCompleter<T>>,
     pool: Arc<Pool>,
@@ -47,7 +52,7 @@ pub fn worker_main<T: Operands + Send + 'static>(
             Ok((endpoint, address))
         }) {
         Ok((endpoint, address)) => {
-            ready.send(Ok(address));
+            ready.send(Ok((address, endpoint.local_mr_domain())));
             endpoint
         }
         Err(error) => {
@@ -100,14 +105,6 @@ pub fn worker_main<T: Operands + Send + 'static>(
                     &mut pending_removal,
                     client_id,
                 ),
-                // The submitter is blocked on this reply, so answer even when the pin fails.
-                Ok(WorkerMessage::Register {
-                    base,
-                    length,
-                    reply,
-                }) => {
-                    reply.send(endpoint.pin_region(base, length));
-                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     disconnected = true;
@@ -244,13 +241,6 @@ pub fn worker_main<T: Operands + Send + 'static>(
                     &mut pending_removal,
                     client_id,
                 ),
-                Ok(WorkerMessage::Register {
-                    base,
-                    length,
-                    reply,
-                }) => {
-                    reply.send(endpoint.pin_region(base, length));
-                }
                 Err(_) => break, // channel closed and nothing left → shutdown
             }
         } else if 0 == posted && !reaped_any {

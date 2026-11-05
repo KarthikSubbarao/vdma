@@ -4,7 +4,7 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 use std::ptr;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use crate::sys::{
     FI_EAGAIN, FI_EAVAIL, FI_MR_ALLOCATED, FI_MR_ENDPOINT, FI_MR_HMEM, FI_MR_LOCAL, FI_MR_PROV_KEY,
@@ -12,8 +12,8 @@ use crate::sys::{
     FI_TRANSMIT, FI_WRITE, fi_allocinfo, fi_av_attr, fi_av_open, fi_av_type_FI_AV_MAP, fi_cq_attr,
     fi_cq_entry, fi_cq_err_entry, fi_cq_format_FI_CQ_FORMAT_CONTEXT, fi_cq_open, fi_cq_read,
     fi_cq_readerr, fi_domain, fi_dupinfo, fi_enable, fi_endpoint, fi_ep_bind, fi_ep_type_FI_EP_RDM,
-    fi_fabric, fi_freeinfo, fi_getinfo, fi_getname, fi_info, fi_version, fid_av, fid_cq,
-    fid_domain, fid_ep, fid_fabric,
+    fi_fabric, fi_freeinfo, fi_getinfo, fi_getname, fi_info, fi_threading_FI_THREAD_SAFE,
+    fi_version, fid_av, fid_cq, fid_domain, fid_ep, fid_fabric,
 };
 use dma_libfabric_protocol::DmaError;
 
@@ -23,6 +23,10 @@ use crate::error::{check, fabric_error};
 use crate::local_regions::{LocalOperand, LocalRegions};
 use crate::operands::CacheableSpan;
 use crate::peer_addresses::{AddressFormat, PeerAddresses, RegisteredAddress};
+
+/// An endpoint's domain as an address, for registering on it from threads other than the worker.
+/// `None` once the endpoint has started closing.
+pub(crate) type SharedDomain = Arc<RwLock<Option<usize>>>;
 
 /// Guard a completion's `op_context` before the caller reclaims it as an owned allocation. A
 /// provider reporting a completion for an op we never posted would otherwise be boxed from null.
@@ -53,6 +57,10 @@ pub struct LibfabricEndpoint {
     /// Registrations covering the memory used as RMA operands, so the hot path reuses a descriptor
     /// instead of calling `fi_mr_reg` per op.
     local_regions: LocalRegions,
+    /// `domain` for other threads to register on: `Some` from open until `Drop` takes the write
+    /// lock and clears it, before closing the domain. A registration in progress holds the read
+    /// lock, so the domain cannot close under it.
+    shared_domain: SharedDomain,
     /// Address-vector entries, shared between clients advertising the same address.
     peer_addresses: PeerAddresses,
 }
@@ -102,6 +110,9 @@ pub(crate) fn query_info(
         (*hints).caps = caps;
         (*(*hints).ep_attr).type_ = fi_ep_type_FI_EP_RDM;
         (*(*hints).domain_attr).mr_mode = mr_mode as i32;
+        // `FabricService::register` calls fi_mr_reg on its caller's thread while the worker posts
+        // transfers on the same domain, so the domain must allow concurrent calls.
+        (*(*hints).domain_attr).threading = fi_threading_FI_THREAD_SAFE;
         // Leave addr_format unspecified so each provider picks its native format — FI_SOCKADDR_IN
         // for tcp, its own fabric address for efa. Addresses are exchanged opaquely.
         (*(*hints).fabric_attr).prov_name = provider.as_ptr().cast_mut();
@@ -167,6 +178,7 @@ impl LibfabricEndpoint {
             uses_virtual_addressing: false,
             max_tx: 0,
             local_regions: LocalRegions::new(ptr::null_mut()),
+            shared_domain: Arc::new(RwLock::new(None)),
             peer_addresses: PeerAddresses::new(ptr::null_mut(), AddressFormat::Opaque),
         };
 
@@ -216,6 +228,10 @@ impl LibfabricEndpoint {
                 "fi_domain",
             )?;
             endpoint.local_regions = LocalRegions::new(endpoint.domain);
+            *endpoint
+                .shared_domain
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = Some(endpoint.domain as usize);
 
             let mut av_attr: fi_av_attr = std::mem::zeroed();
             av_attr.type_ = fi_av_type_FI_AV_MAP;
@@ -383,13 +399,11 @@ impl LibfabricEndpoint {
         self.address_vector
     }
 
-    /// Register a caller-owned span on this endpoint's domain so operands inside it cost no
-    /// `fi_mr_reg`. A provider needing no local registration has nothing to pin.
-    pub(crate) fn pin_region(&mut self, base: usize, length: usize) -> Result<(), DmaError> {
-        if !self.requires_local_mr {
-            return Ok(());
-        }
-        self.local_regions.pin(base, length)
+    /// The domain handle other threads register on, when the provider needs local registrations
+    /// (efa), else `None`: there is nothing to pin.
+    pub(crate) fn local_mr_domain(&self) -> Option<SharedDomain> {
+        self.requires_local_mr
+            .then(|| Arc::clone(&self.shared_domain))
     }
 
     /// The local descriptor covering an RMA operand. A null descriptor and no registration for tcp
@@ -514,6 +528,11 @@ fn decode_caps(caps: u64) -> String {
 impl Drop for LibfabricEndpoint {
     fn drop(&mut self) {
         use crate::sys::fi_close;
+        // Retire the shared domain first, waiting out any registration still running on it.
+        *self
+            .shared_domain
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = None;
         // The local memory regions are domain objects, so they must close before the domain. The
         // worker has joined, so no in-flight op still holds an Rc clone.
         self.local_regions.clear();
