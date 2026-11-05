@@ -27,6 +27,19 @@ providers = ["efa-direct"]
 #   interfaces = ["rdmap16s27"]
 interfaces = []
 
+# Follow each DMA.GET write with a read of the last byte, so the reply is sent strictly
+# after the payload has reached the client's memory. A write completion on EFA only strictly means
+# the client's NIC has committed to write the data. The reply travels over a different NIC, so
+# without this the reply is ordered by timing between:
+# A: PCIe
+# B: client EFA ack -> wire -> server EFA completion -> application -> serialization -> copy -> kernel -> NIC -> TCP+wire -> client NIC -> kernel -> copy -> deserialization -> application
+# If B wins, then the data in the buffer is incomplete. If the impact and risk of B winning is low enough,
+# then you can disable quiesce and elide 1 RTT from GET latency.
+#
+# This setting costs one extra fabric round trip per GET. Clients must register GET buffers with FI_REMOTE_READ.
+#   default: false
+quiesce_writes = true
+
 # Leave `bind` UNSET for EFA: the endpoint binds to the EFA device and advertises its own fabric
 # address (not an IP). Server and clients must be EFA-RDMA instances in the same cluster placement
 # group / security group. (Pinning an IP here is a tcp-only convenience.)

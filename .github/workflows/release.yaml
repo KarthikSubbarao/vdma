@@ -9,10 +9,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # ofi-libfabric-sys needs 2.x headers.
-  LIBFABRIC_VERSION: 2.7.0
-  # so actions/cache can restore
-  LIBFABRIC_PREFIX: /home/runner/libfabric
 
 jobs:
   publish:
@@ -21,23 +17,7 @@ jobs:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@stable
     - uses: Swatinem/rust-cache@v2
-
-    - uses: actions/cache@v4
-      id: libfabric
-      with:
-        path: ${{ env.LIBFABRIC_PREFIX }}
-        key: libfabric-${{ env.LIBFABRIC_VERSION }}-${{ runner.os }}
-
-    - name: Build libfabric
-      if: steps.libfabric.outputs.cache-hit != 'true'
-      run: |
-        curl -sSfL "https://github.com/ofiwg/libfabric/releases/download/v${LIBFABRIC_VERSION}/libfabric-${LIBFABRIC_VERSION}.tar.bz2" | tar xj
-        cd "libfabric-${LIBFABRIC_VERSION}"
-        ./configure --prefix="${LIBFABRIC_PREFIX}"
-        make -j"$(nproc)"
-        make install
-
-    - run: echo "PKG_CONFIG_PATH=${LIBFABRIC_PREFIX}/lib/pkgconfig" >> "$GITHUB_ENV"
+    - uses: ./.github/actions/libfabric
 
     # Publishes each crate whose version isn't on crates.io yet, in dependency order; a push that
     # bumps nothing is a no-op.
