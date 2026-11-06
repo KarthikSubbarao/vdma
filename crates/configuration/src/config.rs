@@ -148,5 +148,13 @@ mod tests {
             configuration.dma_libfabric.bind.as_deref(),
             Some("10.0.0.1")
         );
+        assert!(!configuration.dma_libfabric.quiesce_writes);
+    }
+
+    #[test]
+    fn parses_quiesce_writes() {
+        let configuration = Configuration::from_toml("[dma-libfabric]\nquiesce_writes = true\n")
+            .expect("section parses");
+        assert!(configuration.dma_libfabric.quiesce_writes);
     }
 }

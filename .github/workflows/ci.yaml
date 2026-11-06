@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+# A new push to a PR supersedes the run in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt
+    - run: cargo fmt --all --check
+
+  check:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+    - uses: Swatinem/rust-cache@v2
+    - uses: ./.github/actions/libfabric
+    # Warnings are denied in the workspace lints, so this fails on any.
+    - run: cargo clippy --workspace --all-targets
+    - run: cargo test --workspace

@@ -399,6 +399,15 @@ impl LibfabricEndpoint {
         self.address_vector
     }
 
+    /// Register a caller-owned span on this endpoint's domain so operands inside it cost no
+    /// `fi_mr_reg`. A provider needing no local registration has nothing to pin.
+    pub(crate) fn pin_region(&mut self, base: usize, length: usize) -> Result<(), DmaError> {
+        if !self.requires_local_mr {
+            return Ok(());
+        }
+        self.local_regions.pin(base, length)
+    }
+
     /// The domain handle other threads register on, when the provider needs local registrations
     /// (efa), else `None`: there is nothing to pin.
     pub(crate) fn local_mr_domain(&self) -> Option<SharedDomain> {

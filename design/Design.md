@@ -65,7 +65,14 @@ ValkeyString memory. Valkey server is always the DMA initiator. Clients are pass
 targets.
 
 ### Direction
-* `DMA.GET`: `fi_writemsg` local -> peer using `FI_DELIVERY_COMPLETE` semantic
+* `DMA.GET`: `fi_writemsg` local -> peer, flagged `FI_DELIVERY_COMPLETE`. On EFA
+  that only means the target device has initiated its posted writes. `efa-direct` ignores
+  the flag. The RESP reply travels over a different NIC, so without `quiesce_writes` it is
+  ordered behind the payload by timing. With `quiesce_writes`, a one-byte `fi_read` follows
+  the write, and the write response waits for the read to complete. The target NIC can't
+  return the read ahead of its own posted writes.
+  Without `quiesce_writes`, the race is between local PCIe and 2 remote servers + kernels +
+  serialization + tcp + 1.5 wire RTT's + application time.
 * `DMA.SET`: `fi_read` peer -> local.
 
 ### Async / in-flight

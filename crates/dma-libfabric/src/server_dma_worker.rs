@@ -44,10 +44,15 @@ pub fn worker_main<T: Operands + Send + 'static>(
     pool: Arc<Pool>,
     outstanding: &AtomicUsize,
 ) {
+    let mut quiesce = Box::new([0u8; 8]);
+    let quiesce_pointer = quiesce.as_mut_ptr();
     // The endpoint's fabric address doubles as the readiness signal — clients insert it via
     // dma.hello so the server can RMA against them on efa-direct.
     let mut endpoint = match LibfabricEndpoint::open(&configuration, configuration.bind.as_deref())
-        .and_then(|endpoint| {
+        .and_then(|mut endpoint| {
+            if configuration.quiesce_writes {
+                endpoint.pin_region(quiesce_pointer as usize, quiesce.len())?;
+            }
             let address = endpoint.local_address()?;
             Ok((endpoint, address))
         }) {
@@ -71,6 +76,8 @@ pub fn worker_main<T: Operands + Send + 'static>(
     let mut outstanding_by_client: HashMap<u64, usize> = HashMap::new();
     let mut pending_removal: HashSet<u64> = HashSet::new();
     let mut pending: VecDeque<Prepared<T>> = VecDeque::new();
+    // Completed writes waiting to post their quiesce read, still counted as outstanding.
+    let mut quiescing: VecDeque<Quiescing<T>> = VecDeque::new();
     let mut in_flight: usize = 0;
     let mut reaped: Vec<(*mut c_void, Result<(), DmaError>)> = Vec::new();
     let mut disconnected = false;
@@ -87,6 +94,7 @@ pub fn worker_main<T: Operands + Send + 'static>(
             match receiver.try_recv() {
                 Ok(WorkerMessage::Transfer(request)) => accept(
                     request,
+                    configuration.quiesce_writes,
                     &mut outstanding_by_client,
                     outstanding,
                     &mut pending,
@@ -121,7 +129,7 @@ pub fn worker_main<T: Operands + Send + 'static>(
             let Some(mut prepared) = pending.pop_front() else {
                 break;
             };
-            let error = match post(&mut endpoint, &prepared) {
+            let error = match post(&mut endpoint, &mut prepared) {
                 Ok(0) => {
                     in_flight += 1;
                     posted += 1;
@@ -140,15 +148,14 @@ pub fn worker_main<T: Operands + Send + 'static>(
                 Ok(code) => fabric_error(code as i32, "post"),
                 Err(error) => error,
             };
-            // Post failed outright: the op finishes here and is never reaped, so account it.
-            let client_id = prepared.client_id;
-            completions.push(reclaim(prepared.context).into_completion(Err(error)));
-            finish_op(
+            finish_unreaped(
                 &mut endpoint,
                 &mut outstanding_by_client,
                 &mut pending_removal,
                 outstanding,
-                client_id,
+                &mut completions,
+                reclaim(prepared.context),
+                error,
             );
         }
 
@@ -177,7 +184,18 @@ pub fn worker_main<T: Operands + Send + 'static>(
             );
         }
         for (context, result) in reaped.drain(..) {
-            let inflight = reclaim(context.cast::<InFlight<T>>());
+            let mut inflight = reclaim(context.cast::<InFlight<T>>());
+            // A write is done after the quiesce read succeeds.
+            if result.is_ok()
+                && let Some(read) = inflight.quiesce.take()
+            {
+                quiescing.push_back(Quiescing {
+                    inflight,
+                    read,
+                    stalled_since: None,
+                });
+                continue;
+            }
             finish_op(
                 &mut endpoint,
                 &mut outstanding_by_client,
@@ -194,12 +212,46 @@ pub fn worker_main<T: Operands + Send + 'static>(
             }
         }
 
-        if should_flush_crc(
-            crc_pending.len(),
-            posted,
-            reaped_any,
-            pending.is_empty() && 0 == in_flight,
-        ) {
+        // Post the quiesce reads
+        let mut attempts = quiescing.len();
+        while 0 < attempts {
+            attempts -= 1;
+            let Some(waiting) = quiescing.pop_front() else {
+                break;
+            };
+            let (inflight, error) = match post_quiesce(&mut endpoint, quiesce_pointer, waiting) {
+                QuiescePost::Posted => {
+                    in_flight += 1;
+                    posted += 1;
+                    continue;
+                }
+                QuiescePost::Again(mut waiting) => {
+                    let stalled_since = *waiting.stalled_since.get_or_insert_with(Instant::now);
+                    if stalled_since.elapsed() < progress_deadline {
+                        quiescing.push_back(waiting);
+                        continue;
+                    }
+                    let error = DmaError::Transfer(format!(
+                        "no progress posting the quiesce read for {progress_deadline:?}: peer unreachable or transmit queue stuck"
+                    ));
+                    (waiting.inflight, error)
+                }
+                QuiescePost::Failed(inflight, error) => (inflight, error),
+            };
+            // The write completed but can't be quiesced, so the transfer fails.
+            finish_unreaped(
+                &mut endpoint,
+                &mut outstanding_by_client,
+                &mut pending_removal,
+                outstanding,
+                &mut completions,
+                inflight,
+                error,
+            );
+        }
+
+        let idle = pending.is_empty() && quiescing.is_empty() && 0 == in_flight;
+        if should_flush_crc(crc_pending.len(), posted, reaped_any, idle) {
             submit_crc_batch(&pool, &complete_batch, std::mem::take(&mut crc_pending));
         }
 
@@ -214,14 +266,15 @@ pub fn worker_main<T: Operands + Send + 'static>(
             (*complete_batch)(completions.drain(..));
         }
 
-        if disconnected && pending.is_empty() && 0 == in_flight {
+        if disconnected && idle {
             break;
         }
-        if 0 == in_flight && pending.is_empty() {
+        if idle {
             // Nothing outstanding: block on the channel to release the core.
             match receiver.recv() {
                 Ok(WorkerMessage::Transfer(request)) => accept(
                     request,
+                    configuration.quiesce_writes,
                     &mut outstanding_by_client,
                     outstanding,
                     &mut pending,
@@ -306,12 +359,13 @@ fn submit_crc_batch<T: Operands + Send + 'static>(
 /// Queue a submitted transfer, or complete it when its operand doesn't resolve.
 fn accept<T: Operands>(
     request: TransferRequest<T>,
+    quiesce_writes: bool,
     outstanding_by_client: &mut HashMap<u64, usize>,
     outstanding: &AtomicUsize,
     pending: &mut VecDeque<Prepared<T>>,
     completions: &mut Vec<Completion<T>>,
 ) {
-    match prepare(request) {
+    match prepare(request, quiesce_writes) {
         Ok(prepared) => {
             *outstanding_by_client.entry(prepared.client_id).or_insert(0) += 1;
             pending.push_back(prepared);
@@ -363,6 +417,83 @@ fn finish_op(
     }
 }
 
+/// Fail orphaned ops
+fn finish_unreaped<T>(
+    endpoint: &mut LibfabricEndpoint,
+    outstanding_by_client: &mut HashMap<u64, usize>,
+    pending_removal: &mut HashSet<u64>,
+    outstanding: &AtomicUsize,
+    completions: &mut Vec<Completion<T>>,
+    inflight: Box<InFlight<T>>,
+    error: DmaError,
+) {
+    let client_id = inflight.client_id;
+    completions.push(inflight.into_completion(Err(error)));
+    finish_op(
+        endpoint,
+        outstanding_by_client,
+        pending_removal,
+        outstanding,
+        client_id,
+    );
+}
+
+/// How posting a quiesce read went.
+enum QuiescePost<T> {
+    /// libfabric holds the op until the read is reaped.
+    Posted,
+    /// `-FI_EAGAIN`: the op comes back to retry.
+    Again(Quiescing<T>),
+    Failed(Box<InFlight<T>>, DmaError),
+}
+
+/// Post a write's quiesce read into the worker's quiesce buffer.
+/// The op itself is the read's `op_context`, as was the write's.
+fn post_quiesce<T>(
+    endpoint: &mut LibfabricEndpoint,
+    landing: *mut u8,
+    waiting: Quiescing<T>,
+) -> QuiescePost<T> {
+    let Quiescing {
+        mut inflight,
+        read,
+        stalled_since,
+    } = waiting;
+    let resolved = endpoint
+        .insert_peer(inflight.client_id, &read.peer_address)
+        .and_then(|peer| Ok((peer, endpoint.local_operand(landing, 1, || None)?)));
+    let (peer, LocalOperand { descriptor, lease }) = match resolved {
+        Ok(resolved) => resolved,
+        Err(error) => return QuiescePost::Failed(inflight, error),
+    };
+    // The write is done with its operand, so the read's landing takes the lease slot.
+    inflight.local_lease = lease;
+    let connection = endpoint.connection(&peer, read.remote_key, read.remote_address);
+    let quiesce = tracing::info_span!(parent: &inflight.wire_span, "quiesce");
+    let context = Box::into_raw(inflight);
+    // SAFETY: the quiesce buffer outlives the worker's every read into it, and its bytes are never
+    // read back.
+    let bytes = unsafe { std::slice::from_raw_parts_mut(landing, 1) };
+    let code = {
+        let _posting = quiesce.enter();
+        connection.post_in(bytes, descriptor, context.cast())
+    };
+    if 0 == code {
+        // SAFETY: posted, so the op is libfabric's until this thread reaps it.
+        unsafe { (*context).await_span = quiesce };
+        return QuiescePost::Posted;
+    }
+    let inflight = reclaim(context);
+    if code == -(FI_EAGAIN as isize) {
+        return QuiescePost::Again(Quiescing {
+            inflight,
+            read,
+            stalled_since,
+        });
+    }
+    QuiescePost::Failed(inflight, fabric_error(code as i32, "quiesce read"))
+}
+
 /// Drop one op from the device-wide tally `submit` raised.
 fn release_outstanding(outstanding: &AtomicUsize) {
     // gotta saturate so it never sees a spurious wrap state
@@ -385,7 +516,7 @@ fn reclaim<T>(context: *mut InFlight<T>) -> Box<InFlight<T>> {
 /// queue full, else error), or `Err` for a setup failure: peer insert or region registration.
 fn post<T: Operands>(
     endpoint: &mut LibfabricEndpoint,
-    prepared: &Prepared<T>,
+    prepared: &mut Prepared<T>,
 ) -> Result<isize, DmaError> {
     let peer = endpoint.insert_peer(prepared.client_id, &prepared.peer_address)?;
     let context = prepared.context.cast::<c_void>();
@@ -435,6 +566,10 @@ fn post<T: Operands>(
             // cannot be deregistered, so a concurrent reclaim cannot pull it out from under the
             // descriptor this post just handed to libfabric.
             (*prepared.context).local_lease = lease;
+            // Posted, so `prepared` is done with the address and the quiesce read takes it.
+            if let Some(quiesce) = (*prepared.context).quiesce.as_mut() {
+                quiesce.peer_address = std::mem::take(&mut prepared.peer_address);
+            }
         }
     }
     Ok(code)
@@ -482,6 +617,27 @@ struct InFlight<T> {
     wire_span: tracing::Span,
     /// Child of `wire_span` covering only the wait, from `fi_*` returning to the completion reaped.
     await_span: tracing::Span,
+    /// Posted once this `ToPeer` write completes. `None` when `quiesce_writes` is off, for `FromPeer`,
+    /// and for an empty write.
+    quiesce: Option<QuiesceRead>,
+}
+
+/// Tiny read back from the end of a write. The target NIC can't return the read ahead of its posted
+/// writes, so the read ensures the payload is in the peer's memory.
+struct QuiesceRead {
+    /// Moved out of [`Prepared`] after the write posts. The peer is re-resolved through the endpoint
+    /// rather than held, so eviction still drops the last clone of a stale entry.
+    peer_address: Vec<u8>,
+    remote_key: u64,
+    remote_address: u64,
+}
+
+/// A completed write waiting for a quiesce read.
+struct Quiescing<T> {
+    inflight: Box<InFlight<T>>,
+    read: QuiesceRead,
+    /// When the provider first answered `-FI_EAGAIN`; the progress deadline counts from here.
+    stalled_since: Option<Instant>,
 }
 
 // SAFETY: moved to a pool worker to finish a checksummed completion. Its raw pointers reference the
@@ -542,7 +698,10 @@ struct Prepared<T> {
 /// Build the per-op `InFlight` box and the post parameters, resolving the local operand out of the
 /// caller's context.
 /// Both run on the worker thread, keeping allocation off the submitting thread.
-fn prepare<T: Operands>(request: TransferRequest<T>) -> Result<Prepared<T>, Completion<T>> {
+fn prepare<T: Operands>(
+    request: TransferRequest<T>,
+    quiesce_writes: bool,
+) -> Result<Prepared<T>, Completion<T>> {
     let mut inflight = Box::new(InFlight {
         // Provider-owned scratch; it initializes this when the op is posted.
         _context2: unsafe { std::mem::zeroed() },
@@ -556,6 +715,7 @@ fn prepare<T: Operands>(request: TransferRequest<T>) -> Result<Prepared<T>, Comp
         local_lease: None,
         wire_span: tracing::Span::none(),
         await_span: tracing::Span::none(),
+        quiesce: None,
     });
     let operand = match request.direction {
         Direction::ToPeer => match inflight.caller_context.source() {
@@ -587,6 +747,20 @@ fn prepare<T: Operands>(request: TransferRequest<T>) -> Result<Prepared<T>, Comp
     };
     inflight.buffer_pointer = pointer;
     inflight.length = length;
+    if quiesce_writes && matches!(request.direction, Direction::ToPeer) && 0 < length {
+        // The write itself would fail on a range this overflows; refuse before posting either.
+        let Some(last) = request.remote_address.checked_add(length as u64 - 1) else {
+            return Err(Completion {
+                caller_context: inflight.caller_context,
+                outcome: Err(DmaError::Fabric("the peer's buffer range overflows".into())),
+            });
+        };
+        inflight.quiesce = Some(QuiesceRead {
+            peer_address: Vec::new(),
+            remote_key: request.remote_key,
+            remote_address: last,
+        });
+    }
     Ok(Prepared {
         context: Box::into_raw(inflight),
         client_id: request.client_id,
