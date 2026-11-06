@@ -70,7 +70,9 @@ pub fn decode_hex(text: &[u8]) -> Result<Vec<u8>, AdvertisementError> {
     if !text.len().is_multiple_of(2) {
         return Err(AdvertisementError::Hex);
     }
-    text.chunks_exact(2)
+    text.as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let high = (pair[0] as char)
                 .to_digit(16)

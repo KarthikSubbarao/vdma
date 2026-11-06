@@ -1,0 +1,38 @@
+name: libfabric
+description: Build libfabric from a release tarball, cached, and point pkg-config at it.
+
+inputs:
+  version:
+    description: libfabric release; ofi-libfabric-sys needs 2.x headers.
+    default: 2.7.0
+  prefix:
+    description: Install prefix, under the runner's home so actions/cache can restore it.
+    default: /home/runner/libfabric
+
+runs:
+  using: composite
+  steps:
+  - uses: actions/cache@v4
+    id: cache
+    with:
+      path: ${{ inputs.prefix }}
+      key: libfabric-${{ inputs.version }}-${{ runner.os }}
+
+  - name: Build libfabric
+    if: steps.cache.outputs.cache-hit != 'true'
+    shell: bash
+    env:
+      LIBFABRIC_VERSION: ${{ inputs.version }}
+      LIBFABRIC_PREFIX: ${{ inputs.prefix }}
+    run: |
+      curl -sSfL "https://github.com/ofiwg/libfabric/releases/download/v${LIBFABRIC_VERSION}/libfabric-${LIBFABRIC_VERSION}.tar.bz2" | tar xj
+      cd "libfabric-${LIBFABRIC_VERSION}"
+      ./configure --prefix="${LIBFABRIC_PREFIX}"
+      make -j"$(nproc)"
+      make install
+
+  # pkg-config finds it for the build; the loader needs its own path for test binaries.
+  - shell: bash
+    run: |
+      echo "PKG_CONFIG_PATH=${{ inputs.prefix }}/lib/pkgconfig" >> "$GITHUB_ENV"
+      echo "LD_LIBRARY_PATH=${{ inputs.prefix }}/lib" >> "$GITHUB_ENV"

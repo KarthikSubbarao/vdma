@@ -33,6 +33,10 @@ most portable approach is to register a bounce buffer per client instance.
 It's not the fastest thing possible, but it's the easiest functional bar to
 clear.
 
+Register `DMA.SET` buffers with `FI_REMOTE_READ`, since the server reads them. Register
+`DMA.GET` buffers with `FI_REMOTE_WRITE`, and with `FI_REMOTE_READ` if the server sets
+`quiesce_writes`. Registering all buffers with both works fine.
+
 Once a bounce buffer works, consider the target use cases. If someone wants
 to DMA to a video card, there may be some large memory region that can be
 registered, filled, and reused.

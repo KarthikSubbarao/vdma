@@ -75,6 +75,19 @@ pub struct Configuration {
     /// A connecting or dead client will loop with this status. Defaults to one second.
     #[serde(default = "default_progress_deadline")]
     pub progress_deadline: Duration,
+    /// Follow each `ToPeer` write with a read of the last byte.
+    ///
+    /// A write completion, at least on EFA, only promises the target NIC has initiated its posted
+    /// writes. A subsequent read is ordered after the write on the target's PCIe, so happens-before
+    /// is established.
+    ///
+    /// This can matter when the "done" signal takes another path where relative ordering is not
+    /// strictly guaranteed, like a RESP reply over a different NIC. The target must expose write
+    /// buffers with `FI_REMOTE_READ`.
+    ///
+    /// Off by default.
+    #[serde(default)]
+    pub quiesce_writes: bool,
 }
 
 fn default_progress_deadline() -> Duration {
@@ -90,6 +103,7 @@ impl Default for Configuration {
             max_in_flight: None,
             crc_pool_threads: None,
             progress_deadline: default_progress_deadline(),
+            quiesce_writes: false,
         }
     }
 }

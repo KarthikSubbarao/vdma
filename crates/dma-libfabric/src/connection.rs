@@ -42,9 +42,10 @@ impl LibfabricConnection<'_> {
         }
     }
 
-    /// Post an `fi_writemsg`, the `dma.get` direction. Under `FI_DELIVERY_COMPLETE` the completion
-    /// fires only once the peer has applied the write, so a reply can't race ahead of the payload
-    /// landing.
+    /// Post an `fi_writemsg`, the `dma.get` direction. `FI_DELIVERY_COMPLETE` asks for a completion
+    /// once the peer has applied the write, but an EFA NIC only promises it has initiated its
+    /// posted writes. `efa-direct` ignores the flag. A reply sent by another device can technically beat
+    /// the payload; `quiesce_writes` guarantees writes are there with a sentinel read back.
     pub(crate) fn post_out(
         &self,
         bytes: &[u8],
