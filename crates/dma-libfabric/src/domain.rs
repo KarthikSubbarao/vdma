@@ -1,4 +1,4 @@
-//! A libfabric domain its fabric. For sharing and keeping close lifecycle straight.
+//! A libfabric domain with its fabric. For sharing and keeping close lifecycle straight.
 
 use std::ptr;
 use std::sync::Arc;

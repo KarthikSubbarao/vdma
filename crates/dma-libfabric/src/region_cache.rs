@@ -143,10 +143,9 @@ pub fn invalidate(start: usize, end: usize) {
     drop(retired);
 }
 
-/// Retire every region on `domain`, called by an endpoint before closing that domain (regions are
-/// domain objects). Dropping them from the registry stops a later reclaim from driving the cache
-/// into a region whose domain is gone. Scoped to one domain so tearing down a worker leaves the
-/// others' regions alone.
+/// Release leases on `domain`. This is called by an endpoint when it's ready to close that domain.
+/// When the outstanding operations are drained and the FabricService is dropped, the Domain will
+/// be dropped and closed.
 pub(crate) fn clear_domain(domain: usize) {
     let retired: Vec<Arc<Registration>> = {
         let mut registry = lock();
