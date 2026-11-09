@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use crate::domain::Domain;
 use crate::sys::{fi_close, fid_mr};
 
 /// A live `fi_mr_reg`, deregistered when the last holder drops it.
@@ -26,6 +27,8 @@ use crate::sys::{fi_close, fid_mr};
 /// there. What it must not do is die early underneath a posted descriptor.
 pub(crate) struct Registration {
     memory_region: *mut fid_mr,
+    /// Released after `Drop` closes `memory_region`, so the domain outlives it.
+    _domain: Arc<Domain>,
 }
 
 // SAFETY: the `fid_mr` is only read as a descriptor, which libfabric permits from any thread, and
@@ -34,9 +37,12 @@ unsafe impl Send for Registration {}
 unsafe impl Sync for Registration {}
 
 impl Registration {
-    /// Take ownership of a freshly registered region.
-    pub(crate) fn new(memory_region: *mut fid_mr) -> Arc<Self> {
-        Arc::new(Self { memory_region })
+    /// Take ownership of a region freshly registered on `domain`.
+    pub(crate) fn new(memory_region: *mut fid_mr, domain: Arc<Domain>) -> Arc<Self> {
+        Arc::new(Self {
+            memory_region,
+            _domain: domain,
+        })
     }
 
     pub(crate) fn memory_region(&self) -> *mut fid_mr {
@@ -187,9 +193,8 @@ mod tests {
     use super::{Registration, clear_domain, covering, invalidate, track};
     use crate::operands::CacheableSpan;
     use crate::sys::{
-        FI_READ, FI_REMOTE_READ, FI_REMOTE_WRITE, FI_WRITE, fi_allocinfo, fi_close, fi_domain,
-        fi_ep_type_FI_EP_RDM, fi_fabric, fi_freeinfo, fi_getinfo, fi_info, fi_mr_reg, fi_version,
-        fid_domain, fid_fabric, fid_mr,
+        FI_READ, FI_REMOTE_READ, FI_REMOTE_WRITE, FI_WRITE, fi_allocinfo, fi_ep_type_FI_EP_RDM,
+        fi_freeinfo, fi_getinfo, fi_info, fi_mr_reg, fi_version, fid_mr,
     };
     use std::ffi::CString;
     use std::os::raw::c_void;
@@ -199,9 +204,7 @@ mod tests {
     /// A real tcp domain, because [`invalidate`] closes whatever it removes: a fake `fid_mr` would
     /// fault inside libfabric before any assertion could run.
     struct Domain {
-        domain: *mut fid_domain,
-        fabric: *mut fid_fabric,
-        info: *mut fi_info,
+        shared: Arc<crate::domain::Domain>,
         /// tcp selects keys application-side, and requesting one twice on a domain fails the second
         /// registration with `-FI_ENOKEY`, so every registration here takes a fresh one.
         next_key: std::cell::Cell<u64>,
@@ -211,9 +214,7 @@ mod tests {
         fn open() -> Self {
             let provider = CString::new("tcp").expect("provider name");
             let mut info: *mut fi_info = ptr::null_mut();
-            let mut fabric: *mut fid_fabric = ptr::null_mut();
-            let mut domain: *mut fid_domain = ptr::null_mut();
-            unsafe {
+            let shared = unsafe {
                 let hints = fi_allocinfo();
                 assert!(!hints.is_null(), "fi_allocinfo");
                 (*(*hints).ep_attr).type_ = fi_ep_type_FI_EP_RDM;
@@ -229,21 +230,10 @@ mod tests {
                 (*(*hints).fabric_attr).prov_name = ptr::null_mut();
                 fi_freeinfo(hints);
                 assert_eq!(0, code, "fi_getinfo(tcp)");
-                assert_eq!(
-                    0,
-                    fi_fabric((*info).fabric_attr, &raw mut fabric, ptr::null_mut()),
-                    "fi_fabric"
-                );
-                assert_eq!(
-                    0,
-                    fi_domain(fabric, info, &raw mut domain, ptr::null_mut()),
-                    "fi_domain"
-                );
-            }
+                crate::domain::Domain::open(info).expect("open the domain")
+            };
             Self {
-                domain,
-                fabric,
-                info,
+                shared,
                 next_key: std::cell::Cell::new(1),
             }
         }
@@ -251,7 +241,11 @@ mod tests {
         /// The registry partitions by domain, so this doubles as this test's private namespace —
         /// the registry is a process-global that every test in this binary shares.
         fn key(&self) -> usize {
-            self.domain as usize
+            self.shared.key()
+        }
+
+        fn registration(&self, memory: &mut [u8]) -> Arc<Registration> {
+            Registration::new(self.register(memory), Arc::clone(&self.shared))
         }
 
         fn register(&self, memory: &mut [u8]) -> *mut fid_mr {
@@ -260,7 +254,7 @@ mod tests {
             let mut region: *mut fid_mr = ptr::null_mut();
             let code = unsafe {
                 fi_mr_reg(
-                    self.domain,
+                    self.shared.handle(),
                     memory.as_ptr().cast::<c_void>(),
                     memory.len(),
                     u64::from(FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE),
@@ -279,11 +273,6 @@ mod tests {
     impl Drop for Domain {
         fn drop(&mut self) {
             clear_domain(self.key());
-            unsafe {
-                fi_close(&mut (*self.domain).fid);
-                fi_close(&mut (*self.fabric).fid);
-                fi_freeinfo(self.info);
-            }
         }
     }
 
@@ -302,7 +291,7 @@ mod tests {
         let domain = Domain::open();
         let mut extent = vec![0u8; 64 * 1024];
         let base = extent.as_mut_ptr() as usize;
-        let registration = Registration::new(domain.register(&mut extent));
+        let registration = domain.registration(&mut extent);
         track(base, base + extent.len(), domain.key(), &registration);
         drop(registration); // the registry is the only holder now, as it is in production
 
@@ -338,7 +327,7 @@ mod tests {
     fn a_cacheable_span_widens_the_registration() {
         const EXTENT: usize = 64 * 1024;
         let domain = Domain::open();
-        let mut regions = crate::local_regions::LocalRegions::new(domain.domain);
+        let mut regions = crate::local_regions::LocalRegions::new(Arc::clone(&domain.shared));
 
         // Over-allocated and then aligned into: an operand straddling an extent boundary would be
         // widened to two extents, and whether it does is down to where the allocator landed the
@@ -389,7 +378,7 @@ mod tests {
         let domain = Domain::open();
         let mut extent = vec![0u8; 8192];
         let base = extent.as_mut_ptr() as usize;
-        let registration = Registration::new(domain.register(&mut extent));
+        let registration = domain.registration(&mut extent);
         track(base, base + extent.len(), domain.key(), &registration);
         drop(registration);
 
@@ -414,7 +403,7 @@ mod tests {
         let domain = Domain::open();
         let mut arena = vec![0u8; 64 * 1024];
         let base = arena.as_mut_ptr() as usize;
-        let mut regions = crate::local_regions::LocalRegions::new(domain.domain);
+        let mut regions = crate::local_regions::LocalRegions::new(Arc::clone(&domain.shared));
 
         regions.pin(base, arena.len()).expect("pin the arena");
 
@@ -439,7 +428,7 @@ mod tests {
         let mut arena = vec![0u8; 8192];
         let base = arena.as_mut_ptr() as usize;
         let end = base + arena.len();
-        let mut regions = crate::local_regions::LocalRegions::new(domain.domain);
+        let regions = crate::local_regions::LocalRegions::new(Arc::clone(&domain.shared));
         regions.pin(base, arena.len()).expect("pin the arena");
 
         let lease = covering(base, end, domain.key()).expect("just pinned");
@@ -465,7 +454,7 @@ mod tests {
         let mut arena = vec![0u8; 8192];
         let base = arena.as_mut_ptr() as usize;
         let end = base + arena.len();
-        let mut regions = crate::local_regions::LocalRegions::new(domain.domain);
+        let regions = crate::local_regions::LocalRegions::new(Arc::clone(&domain.shared));
         regions.pin(base, arena.len()).expect("pin the arena");
 
         // The server goes first.
@@ -495,7 +484,7 @@ mod tests {
             })
             .collect();
         for (index, extent) in extents.iter_mut().enumerate() {
-            let registration = Registration::new(domain.register(extent));
+            let registration = domain.registration(extent);
             track(bounds[index].0, bounds[index].1, key, &registration);
         }
 
@@ -531,7 +520,7 @@ mod tests {
             }
             // Re-register so the readers keep finding entries to lease.
             for (index, extent) in extents.iter_mut().enumerate() {
-                let registration = Registration::new(domain.register(extent));
+                let registration = domain.registration(extent);
                 track(bounds[index].0, bounds[index].1, key, &registration);
             }
         }

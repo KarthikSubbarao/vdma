@@ -1,32 +1,29 @@
-//! A local libfabric endpoint: fabric, domain, address vector, completion queue, and an enabled
-//! `FI_EP_RDM` endpoint. All owned, and closed on drop in reverse construction order.
+//! A local libfabric endpoint: address vector, completion queue, and an enabled `FI_EP_RDM`
+//! endpoint, closed on drop in reverse construction order, over a shared [`Domain`].
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 use std::ptr;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::Arc;
 
 use crate::sys::{
     FI_EAGAIN, FI_EAVAIL, FI_MR_ALLOCATED, FI_MR_ENDPOINT, FI_MR_HMEM, FI_MR_LOCAL, FI_MR_PROV_KEY,
     FI_MR_VIRT_ADDR, FI_MSG, FI_READ, FI_RECV, FI_REMOTE_READ, FI_REMOTE_WRITE, FI_RMA, FI_SOURCE,
     FI_TRANSMIT, FI_WRITE, fi_allocinfo, fi_av_attr, fi_av_open, fi_av_type_FI_AV_MAP, fi_cq_attr,
     fi_cq_entry, fi_cq_err_entry, fi_cq_format_FI_CQ_FORMAT_CONTEXT, fi_cq_open, fi_cq_read,
-    fi_cq_readerr, fi_domain, fi_dupinfo, fi_enable, fi_endpoint, fi_ep_bind, fi_ep_type_FI_EP_RDM,
-    fi_fabric, fi_freeinfo, fi_getinfo, fi_getname, fi_info, fi_threading_FI_THREAD_SAFE,
-    fi_version, fid_av, fid_cq, fid_domain, fid_ep, fid_fabric,
+    fi_cq_readerr, fi_dupinfo, fi_enable, fi_endpoint, fi_ep_bind, fi_ep_type_FI_EP_RDM,
+    fi_freeinfo, fi_getinfo, fi_getname, fi_info, fi_threading_FI_THREAD_SAFE, fi_version, fid_av,
+    fid_cq, fid_ep,
 };
 use dma_libfabric_protocol::DmaError;
 
 use crate::configuration::{Configuration, Provider};
 use crate::connection::LibfabricConnection;
+use crate::domain::Domain;
 use crate::error::{check, fabric_error};
 use crate::local_regions::{LocalOperand, LocalRegions};
 use crate::operands::CacheableSpan;
 use crate::peer_addresses::{AddressFormat, PeerAddresses, RegisteredAddress};
-
-/// An endpoint's domain as an address, for registering on it from threads other than the worker.
-/// `None` once the endpoint has started closing.
-pub(crate) type SharedDomain = Arc<RwLock<Option<usize>>>;
 
 /// Guard a completion's `op_context` before the caller reclaims it as an owned allocation. A
 /// provider reporting a completion for an op we never posted would otherwise be boxed from null.
@@ -45,9 +42,7 @@ pub struct LibfabricEndpoint {
     endpoint: *mut fid_ep,
     completion_queue: *mut fid_cq,
     address_vector: *mut fid_av,
-    domain: *mut fid_domain,
-    fabric: *mut fid_fabric,
-    info: *mut fi_info,
+    domain: Arc<Domain>,
     /// `FI_MR_LOCAL`, as efa does: local RMA buffers must be registered and a descriptor passed.
     requires_local_mr: bool,
     /// `FI_MR_VIRT_ADDR`, as efa does: remote RMA addresses are virtual addresses, not offsets.
@@ -57,10 +52,6 @@ pub struct LibfabricEndpoint {
     /// Registrations covering the memory used as RMA operands, so the hot path reuses a descriptor
     /// instead of calling `fi_mr_reg` per op.
     local_regions: LocalRegions,
-    /// `domain` for other threads to register on: `Some` from open until `Drop` takes the write
-    /// lock and clears it, before closing the domain. A registration in progress holds the read
-    /// lock, so the domain cannot close under it.
-    shared_domain: SharedDomain,
     /// Address-vector entries, shared between clients advertising the same address.
     peer_addresses: PeerAddresses,
 }
@@ -166,24 +157,8 @@ impl LibfabricEndpoint {
         configuration: &Configuration,
         source_node: Option<&str>,
     ) -> Result<Self, DmaError> {
-        // All-null, so an early error drops a partially-built endpoint and closes only what opened.
-        let mut endpoint = LibfabricEndpoint {
-            endpoint: ptr::null_mut(),
-            completion_queue: ptr::null_mut(),
-            address_vector: ptr::null_mut(),
-            domain: ptr::null_mut(),
-            fabric: ptr::null_mut(),
-            info: ptr::null_mut(),
-            requires_local_mr: false,
-            uses_virtual_addressing: false,
-            max_tx: 0,
-            local_regions: LocalRegions::new(ptr::null_mut()),
-            shared_domain: Arc::new(RwLock::new(None)),
-            peer_addresses: PeerAddresses::new(ptr::null_mut(), AddressFormat::Opaque),
-        };
-
         let list = query_info(configuration, source_node)?;
-        unsafe {
+        let domain = unsafe {
             // Copy the requested domain out standalone and free the list, so everything downstream
             // operates on the chosen device with no further selection.
             let wanted = configuration.interfaces.first().map(String::as_str);
@@ -198,46 +173,42 @@ impl LibfabricEndpoint {
                     wanted.unwrap_or_default()
                 )));
             }
-            endpoint.info = fi_dupinfo(chosen);
+            let info = fi_dupinfo(chosen);
             fi_freeinfo(list);
-            if endpoint.info.is_null() {
+            if info.is_null() {
                 return Err(DmaError::Fabric("fi_dupinfo failed".into()));
             }
+            Domain::open(info)?
+        };
+
+        // All-null, so an early error drops a partially-built endpoint and closes only what opened.
+        let mut endpoint = LibfabricEndpoint {
+            endpoint: ptr::null_mut(),
+            completion_queue: ptr::null_mut(),
+            address_vector: ptr::null_mut(),
+            requires_local_mr: false,
+            uses_virtual_addressing: false,
+            max_tx: 0,
+            local_regions: LocalRegions::new(Arc::clone(&domain)),
+            domain,
+            peer_addresses: PeerAddresses::new(ptr::null_mut(), AddressFormat::Opaque),
+        };
+
+        unsafe {
+            let info = endpoint.domain.info();
+            let domain = endpoint.domain.handle();
 
             // Adapt to the selected provider's memory-registration requirements.
-            let mr_mode = (*(*endpoint.info).domain_attr).mr_mode as u32;
+            let mr_mode = (*(*info).domain_attr).mr_mode as u32;
             endpoint.requires_local_mr = mr_mode & FI_MR_LOCAL != 0;
             endpoint.uses_virtual_addressing = mr_mode & FI_MR_VIRT_ADDR != 0;
-            endpoint.max_tx = (*(*endpoint.info).tx_attr).size;
-
-            check(
-                fi_fabric(
-                    (*endpoint.info).fabric_attr,
-                    &mut endpoint.fabric,
-                    ptr::null_mut(),
-                ),
-                "fi_fabric",
-            )?;
-            check(
-                fi_domain(
-                    endpoint.fabric,
-                    endpoint.info,
-                    &mut endpoint.domain,
-                    ptr::null_mut(),
-                ),
-                "fi_domain",
-            )?;
-            endpoint.local_regions = LocalRegions::new(endpoint.domain);
-            *endpoint
-                .shared_domain
-                .write()
-                .unwrap_or_else(PoisonError::into_inner) = Some(endpoint.domain as usize);
+            endpoint.max_tx = (*(*info).tx_attr).size;
 
             let mut av_attr: fi_av_attr = std::mem::zeroed();
             av_attr.type_ = fi_av_type_FI_AV_MAP;
             check(
                 fi_av_open(
-                    endpoint.domain,
+                    domain,
                     &mut av_attr,
                     &mut endpoint.address_vector,
                     ptr::null_mut(),
@@ -246,14 +217,14 @@ impl LibfabricEndpoint {
             )?;
             endpoint.peer_addresses = PeerAddresses::new(
                 endpoint.address_vector,
-                AddressFormat::from_fi((*endpoint.info).addr_format),
+                AddressFormat::from_fi((*info).addr_format),
             );
 
             let mut cq_attr: fi_cq_attr = std::mem::zeroed();
             cq_attr.format = fi_cq_format_FI_CQ_FORMAT_CONTEXT;
             check(
                 fi_cq_open(
-                    endpoint.domain,
+                    domain,
                     &mut cq_attr,
                     &mut endpoint.completion_queue,
                     ptr::null_mut(),
@@ -262,12 +233,7 @@ impl LibfabricEndpoint {
             )?;
 
             check(
-                fi_endpoint(
-                    endpoint.domain,
-                    endpoint.info,
-                    &mut endpoint.endpoint,
-                    ptr::null_mut(),
-                ),
+                fi_endpoint(domain, info, &mut endpoint.endpoint, ptr::null_mut()),
                 "fi_endpoint",
             )?;
             check(
@@ -399,20 +365,11 @@ impl LibfabricEndpoint {
         self.address_vector
     }
 
-    /// Register a caller-owned span on this endpoint's domain so operands inside it cost no
-    /// `fi_mr_reg`. A provider needing no local registration has nothing to pin.
-    pub(crate) fn pin_region(&mut self, base: usize, length: usize) -> Result<(), DmaError> {
-        if !self.requires_local_mr {
-            return Ok(());
-        }
-        self.local_regions.pin(base, length)
-    }
-
-    /// The domain handle other threads register on, when the provider needs local registrations
-    /// (efa), else `None`: there is nothing to pin.
-    pub(crate) fn local_mr_domain(&self) -> Option<SharedDomain> {
+    /// A handle to register memory on this endpoint's domain.
+    /// Some when the provider needs local registrations (efa), else `None`.
+    pub(crate) fn caller_regions(&self) -> Option<LocalRegions> {
         self.requires_local_mr
-            .then(|| Arc::clone(&self.shared_domain))
+            .then(|| LocalRegions::new(Arc::clone(&self.domain)))
     }
 
     /// The local descriptor covering an RMA operand. A null descriptor and no registration for tcp
@@ -447,7 +404,8 @@ impl LibfabricEndpoint {
     /// A snapshot of the selected provider's attributes, for `DMA.INFO`.
     pub fn describe(&self) -> EndpointInfo {
         unsafe {
-            let prov_name = (*(*self.info).fabric_attr).prov_name;
+            let info = self.domain.info();
+            let prov_name = (*(*info).fabric_attr).prov_name;
             let provider = if prov_name.is_null() {
                 String::new()
             } else {
@@ -455,9 +413,9 @@ impl LibfabricEndpoint {
             };
             EndpointInfo {
                 provider,
-                addr_format: (*self.info).addr_format,
-                mr_mode: (*(*self.info).domain_attr).mr_mode as u32,
-                caps: (*self.info).caps,
+                addr_format: (*info).addr_format,
+                mr_mode: (*(*info).domain_attr).mr_mode as u32,
+                caps: (*info).caps,
                 requires_local_mr: self.requires_local_mr,
                 uses_virtual_addressing: self.uses_virtual_addressing,
             }
@@ -537,13 +495,8 @@ fn decode_caps(caps: u64) -> String {
 impl Drop for LibfabricEndpoint {
     fn drop(&mut self) {
         use crate::sys::fi_close;
-        // Retire the shared domain first, waiting out any registration still running on it.
-        *self
-            .shared_domain
-            .write()
-            .unwrap_or_else(PoisonError::into_inner) = None;
-        // The local memory regions are domain objects, so they must close before the domain. The
-        // worker has joined, so no in-flight op still holds an Rc clone.
+        // The registry's leases hold the domain open. Leases on pool jobs keep the domain open
+        // until that job finishes.
         self.local_regions.clear();
         // Each entry removes itself from the address vector when its last holder drops, so they all
         // have to go before that vector is closed below.
@@ -557,15 +510,6 @@ impl Drop for LibfabricEndpoint {
             }
             if !self.address_vector.is_null() {
                 fi_close(&mut (*self.address_vector).fid);
-            }
-            if !self.domain.is_null() {
-                fi_close(&mut (*self.domain).fid);
-            }
-            if !self.fabric.is_null() {
-                fi_close(&mut (*self.fabric).fid);
-            }
-            if !self.info.is_null() {
-                fi_freeinfo(self.info);
             }
         }
     }

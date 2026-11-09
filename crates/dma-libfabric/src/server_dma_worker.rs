@@ -20,9 +20,9 @@ use crate::Operands;
 use crate::TransferDone;
 use crate::TransferRequest;
 use crate::endpoint::LibfabricEndpoint;
-use crate::endpoint::SharedDomain;
 use crate::error::fabric_error;
 use crate::local_regions::LocalOperand;
+use crate::local_regions::LocalRegions;
 use crate::pool::Pool;
 use crate::region_cache::Registration;
 use crate::reply::Answer;
@@ -32,9 +32,9 @@ use crate::server::WorkerMessage;
 /// batch, and so one downstream lock acquisition, accumulates.
 const TARGET_COMPLETIONS: usize = 10;
 
-/// The worker's readiness signal: its endpoint's fabric address, and the domain handle callers
-/// register on when the provider needs local registrations.
-pub(crate) type WorkerReady = (Vec<u8>, Option<SharedDomain>);
+/// The worker's readiness signal: its endpoint's fabric address, and the handle callers pin with
+/// when the provider needs local registrations.
+pub(crate) type WorkerReady = (Vec<u8>, Option<LocalRegions>);
 
 pub fn worker_main<T: Operands + Send + 'static>(
     configuration: Configuration,
@@ -49,15 +49,17 @@ pub fn worker_main<T: Operands + Send + 'static>(
     // The endpoint's fabric address doubles as the readiness signal — clients insert it via
     // dma.hello so the server can RMA against them on efa-direct.
     let mut endpoint = match LibfabricEndpoint::open(&configuration, configuration.bind.as_deref())
-        .and_then(|mut endpoint| {
-            if configuration.quiesce_writes {
-                endpoint.pin_region(quiesce_pointer as usize, quiesce.len())?;
+        .and_then(|endpoint| {
+            if configuration.quiesce_writes
+                && let Some(regions) = endpoint.caller_regions()
+            {
+                regions.pin(quiesce_pointer as usize, quiesce.len())?;
             }
             let address = endpoint.local_address()?;
             Ok((endpoint, address))
         }) {
         Ok((endpoint, address)) => {
-            ready.send(Ok((address, endpoint.local_mr_domain())));
+            ready.send(Ok((address, endpoint.caller_regions())));
             endpoint
         }
         Err(error) => {

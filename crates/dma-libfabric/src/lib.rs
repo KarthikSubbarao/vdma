@@ -12,6 +12,7 @@ pub mod asynchronous;
 mod configuration;
 mod connection;
 mod devices;
+mod domain;
 mod endpoint;
 mod error;
 mod local_regions;

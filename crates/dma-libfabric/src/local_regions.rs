@@ -11,9 +11,10 @@ use std::os::raw::c_void;
 use std::ptr;
 use std::sync::Arc;
 
-use crate::sys::{FI_READ, FI_WRITE, fi_mr_desc, fi_mr_reg, fid_domain, fid_mr};
+use crate::sys::{FI_READ, FI_WRITE, fi_mr_desc, fi_mr_reg, fid_mr};
 use dma_libfabric_protocol::DmaError;
 
+use crate::domain::Domain;
 use crate::error::check;
 use crate::operands::CacheableSpan;
 use crate::region_cache::{self, Registration};
@@ -31,11 +32,11 @@ pub(crate) struct LocalOperand {
 /// [`crate::region_cache`].
 #[derive(Debug)]
 pub(crate) struct LocalRegions {
-    domain: *mut fid_domain,
+    domain: Arc<Domain>,
 }
 
 impl LocalRegions {
-    pub(crate) fn new(domain: *mut fid_domain) -> Self {
+    pub(crate) fn new(domain: Arc<Domain>) -> Self {
         Self { domain }
     }
 
@@ -58,7 +59,7 @@ impl LocalRegions {
             .checked_add(length)
             .ok_or_else(|| DmaError::Fabric("local operand range overflows".into()))?;
 
-        let domain = self.domain as usize;
+        let domain = self.domain.key();
         if let Some(lease) = region_cache::covering(start, end, domain) {
             // SAFETY: the lease holds the region open for as long as this operand lives, so the
             //         descriptor cannot be deregistered underneath the transfer that posts it.
@@ -84,7 +85,7 @@ impl LocalRegions {
             Err(error) => Err(error),
         };
         let (base, limit, region) = region?;
-        let lease = Registration::new(region);
+        let lease = Registration::new(region, Arc::clone(&self.domain));
         // SAFETY: freshly registered above, and held by `lease`.
         let descriptor = unsafe { fi_mr_desc(lease.memory_region()) };
         // Only what the caller promised to `invalidate` may outlive this transfer in the registry —
@@ -105,12 +106,15 @@ impl LocalRegions {
     /// [`crate::CacheableSpan`] is needed for these regions.
     /// The registry is the sole holder. The span's lifetime belongs to the caller's
     /// [`crate::MemoryRegion`], whose drop retires this entry.
-    pub(crate) fn pin(&mut self, base: usize, length: usize) -> Result<(), DmaError> {
+    pub(crate) fn pin(&self, base: usize, length: usize) -> Result<(), DmaError> {
         let end = base
             .checked_add(length)
             .ok_or_else(|| DmaError::Fabric("pinned region range overflows".into()))?;
-        let lease = Registration::new(self.register(base as *mut u8, length)?);
-        region_cache::track(base, end, self.domain as usize, &lease);
+        let lease = Registration::new(
+            self.register(base as *mut u8, length)?,
+            Arc::clone(&self.domain),
+        );
+        region_cache::track(base, end, self.domain.key(), &lease);
         Ok(())
     }
 
@@ -121,7 +125,7 @@ impl LocalRegions {
         check(
             unsafe {
                 fi_mr_reg(
-                    self.domain,
+                    self.domain.handle(),
                     pointer as *const c_void,
                     length,
                     u64::from(FI_READ | FI_WRITE),
@@ -137,9 +141,8 @@ impl LocalRegions {
         Ok(memory_region)
     }
 
-    /// Close this domain's registrations before the endpoint closes it, since memory regions are
-    /// domain objects. Also stops a reclaim touching a region whose domain is gone.
+    /// Release the registry's leases on this domain.
     pub(crate) fn clear(&mut self) {
-        region_cache::clear_domain(self.domain as usize);
+        region_cache::clear_domain(self.domain.key());
     }
 }
